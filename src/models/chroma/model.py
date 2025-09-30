@@ -122,18 +122,24 @@ class Chroma(nn.Module):
         )
         self.txt_in = nn.Linear(params.context_in_dim, self.hidden_size)
 
-        self.double_blocks = nn.ModuleList(
-            [
+        double_blocks = []
+        for i in range(params.depth):
+            double_blocks.append(
                 DoubleStreamBlock(
                     self.hidden_size,
                     self.num_heads,
                     mlp_ratio=params.mlp_ratio,
                     qkv_bias=params.qkv_bias,
                     use_compiled=params._use_compiled,
+                    use_img_mlp_moe=i == 0,
+                    moe_num_experts=4,
+                    moe_hidden_dim=max(
+                        1, int(self.hidden_size * params.mlp_ratio // 4)
+                    ),
+                    moe_timestep_scale=1000.0,
                 )
-                for _ in range(params.depth)
-            ]
-        )
+            )
+        self.double_blocks = nn.ModuleList(double_blocks)
 
         self.single_blocks = nn.ModuleList(
             [
@@ -255,11 +261,16 @@ class Chroma(nn.Module):
             # just in case in different GPU for simple pipeline parallel
             if self.training:
                 img, txt = ckpt.checkpoint(
-                    block, img, txt, pe, double_mod, txt_img_mask
+                    block, img, txt, pe, double_mod, txt_img_mask, timesteps
                 )
             else:
                 img, txt = block(
-                    img=img, txt=txt, pe=pe, distill_vec=double_mod, mask=txt_img_mask
+                    img=img,
+                    txt=txt,
+                    pe=pe,
+                    distill_vec=double_mod,
+                    mask=txt_img_mask,
+                    timesteps=timesteps,
                 )
 
         img = torch.cat((txt, img), 1)
