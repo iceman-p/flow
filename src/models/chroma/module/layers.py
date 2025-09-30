@@ -1,5 +1,6 @@
 import math
 from dataclasses import dataclass
+from typing import Optional
 
 import torch
 from einops import rearrange
@@ -466,6 +467,56 @@ def _modulation_gate_fn(x, gate, gate_params):
     return x + gate * gate_params
 
 
+class TimestepMoE(nn.Module):
+    """A lightweight Mixture-of-Experts conditioned solely on timesteps."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        expert_hidden_dim: int,
+        num_experts: int = 4,
+        timestep_scale: float = 1000.0,
+    ) -> None:
+        super().__init__()
+        if num_experts < 1:
+            raise ValueError("num_experts must be at least 1")
+
+        self.experts = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(hidden_size, expert_hidden_dim, bias=True),
+                    nn.GELU(approximate="tanh"),
+                    nn.Linear(expert_hidden_dim, hidden_size, bias=True),
+                )
+                for _ in range(num_experts)
+            ]
+        )
+        boundaries = torch.linspace(0.0, 1.0, steps=num_experts + 1, dtype=torch.float32)[1:-1]
+        self.register_buffer("boundaries", boundaries, persistent=False)
+        self.timestep_scale = float(timestep_scale)
+
+    def forward(self, x: Tensor, timesteps: Tensor) -> Tensor:
+        if timesteps.ndim == 2 and timesteps.shape[1] == 1:
+            timesteps = timesteps.squeeze(1)
+        if timesteps.ndim != 1:
+            raise ValueError("timesteps must be a 1D tensor of shape [batch]")
+        if timesteps.shape[0] != x.shape[0]:
+            raise ValueError("timesteps batch dimension must match input batch")
+
+        norm_timesteps = (timesteps.float() / self.timestep_scale).clamp(0.0, 1.0)
+        # torch.bucketize handles empty boundaries, returning zeros when there is one expert
+        expert_indices = torch.bucketize(norm_timesteps, self.boundaries)
+
+        out = torch.zeros_like(x)
+        for expert_id, expert in enumerate(self.experts):
+            mask = expert_indices == expert_id
+            if not torch.any(mask):
+                continue
+            expert_out = expert(x[mask])
+            out[mask] = expert_out
+        return out
+
+
 class DoubleStreamBlock(nn.Module):
     def __init__(
         self,
@@ -474,6 +525,10 @@ class DoubleStreamBlock(nn.Module):
         mlp_ratio: float,
         qkv_bias: bool = False,
         use_compiled: bool = False,
+        use_img_mlp_moe: bool = False,
+        moe_num_experts: int = 4,
+        moe_hidden_dim: Optional[int] = None,
+        moe_timestep_scale: float = 1000.0,
     ):
         super().__init__()
 
@@ -489,11 +544,22 @@ class DoubleStreamBlock(nn.Module):
         )
 
         self.img_norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.img_mlp = nn.Sequential(
-            nn.Linear(hidden_size, mlp_hidden_dim, bias=True),
-            nn.GELU(approximate="tanh"),
-            nn.Linear(mlp_hidden_dim, hidden_size, bias=True),
-        )
+        if use_img_mlp_moe:
+            expert_hidden_dim = (
+                moe_hidden_dim if moe_hidden_dim is not None else max(1, mlp_hidden_dim // 2)
+            )
+            self.img_mlp = TimestepMoE(
+                hidden_size,
+                expert_hidden_dim,
+                num_experts=moe_num_experts,
+                timestep_scale=moe_timestep_scale,
+            )
+        else:
+            self.img_mlp = nn.Sequential(
+                nn.Linear(hidden_size, mlp_hidden_dim, bias=True),
+                nn.GELU(approximate="tanh"),
+                nn.Linear(mlp_hidden_dim, hidden_size, bias=True),
+            )
 
         self.txt_norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.txt_attn = SelfAttention(
@@ -510,6 +576,7 @@ class DoubleStreamBlock(nn.Module):
             nn.Linear(mlp_hidden_dim, hidden_size, bias=True),
         )
         self.use_compiled = use_compiled
+        self._img_mlp_requires_timesteps = use_img_mlp_moe
 
     @property
     def device(self):
@@ -535,6 +602,7 @@ class DoubleStreamBlock(nn.Module):
         pe: Tensor,
         distill_vec: list[ModulationOut],
         mask: Tensor,
+        timesteps: Optional[Tensor] = None,
     ) -> tuple[Tensor, Tensor]:
         (img_mod1, img_mod2), (txt_mod1, txt_mod2) = distill_vec
 
@@ -577,15 +645,16 @@ class DoubleStreamBlock(nn.Module):
         # img = img + img_mod1.gate * self.img_attn.proj(img_attn)
         # img = img + img_mod2.gate * self.img_mlp((1 + img_mod2.scale) * self.img_norm2(img) + img_mod2.shift)
         img = self.modulation_gate_fn(img, img_mod1.gate, self.img_attn.proj(img_attn))
-        img = self.modulation_gate_fn(
-            img,
-            img_mod2.gate,
-            self.img_mlp(
-                self.modulation_shift_scale_fn(
-                    self.img_norm2(img), img_mod2.scale, img_mod2.shift
-                )
-            ),
+        img_modulated_ff = self.modulation_shift_scale_fn(
+            self.img_norm2(img), img_mod2.scale, img_mod2.shift
         )
+        if self._img_mlp_requires_timesteps:
+            if timesteps is None:
+                raise ValueError("timesteps must be provided when using the MoE image MLP")
+            img_mlp_out = self.img_mlp(img_modulated_ff, timesteps)
+        else:
+            img_mlp_out = self.img_mlp(img_modulated_ff)
+        img = self.modulation_gate_fn(img, img_mod2.gate, img_mlp_out)
 
         # calculate the txt bloks
         # replaced with compiled fn
